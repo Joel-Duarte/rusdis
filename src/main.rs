@@ -3,15 +3,22 @@ use std::{
     sync::{Arc, Mutex},   // Arc for shared ownership, Mutex for mutual exclusion
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt}, // Asynchronous read and write operations on streams
+    io::AsyncWriteExt, // asynchronous write operations // removed read
     net::{TcpListener, TcpStream},     // TcpListener to accept incoming connections, TcpStream for individual connections
 };
+// import our modules
+
+mod protocol; // RespValue enum and RESP serialization/deserialization logic
+mod command;  //  Command enum and command parsing/execution logic
+
+use protocol::RespValue;
+use command::Command;
 
 #[tokio::main] // mark this as the main function for a tokio runtime
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // create in memory HashMap to store key-value pairs with arc<mutex for safe, shared and mutable access to it
-    let db: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
+    // create in memory HashMap to store key-value pairs with arc<mutex for safe, shared and mutable access to it 
+    // changed to Vec<u8> to be binary safe
+    let db: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
     // bind the TcpListener to local address with default redis port
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     println!("Server listening on 127.0.0.1:6379");
@@ -40,108 +47,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// handles a single client conn, reads commands from client, processes them and responds
 async fn handle_client(
     socket: &mut TcpStream,
-    db: Arc<Mutex<HashMap<String, String>>>,
+    db: Arc<Mutex<HashMap<String, Vec<u8>>>>, //changed to Vec<u8>
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // buffer to read incoming data from the client
-    // read up to 1024 bytes at a time
-    let mut buf = vec![0; 1024];
+        loop {
+        // attempt to parse a RESP value from a tcp stream
+        let resp_value = RespValue::from_stream(socket).await;
 
-    // loop indefinitely to read commands
-    loop {
-        // read bytes from the TCP stream into the buffer
-        // "read" returns the number of bytes read. If 0, the client has disconnected
-        let n = socket.read(&mut buf).await?;
+        let cmd: Command;
+        let response: RespValue;
 
-        if n == 0 {
-            // client disconnected
-            return Ok(());
-        }
+        match resp_value{
+            Ok(Some(RespValue::Array(array))) => {
+                // successfuly parsed array, now parse it into our internal command enum
+                cmd = Command::parse_from_resp_array(array);
+                println!("Parsed command: {:?}", cmd); // log parsed command
 
-        // convert the received bytes into a string assuming UTF.8 input
-        let command_str = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-        println!("Received command: '{}'", command_str);
-
-        // simple parsing
-        let parts: Vec<&str> = command_str.split_whitespace().collect();
-
-        // initialize a response string
-        let response: String;
-
-        // match 1st split to available commands
-        match parts.get(0).map(|s| s.to_ascii_uppercase()) {
-            Some(cmd) => {
-                match cmd.as_str(){                
-                    "SET" => {
-                        // handle set command: Set key value
-                        if parts.len() >= 3 {
-                            let key = parts[1].to_string();
-                            // join remaining parts after key parts(1) as value possibly separated by spaces 
-                            let value = parts[2..].join(" ");
-
-                            // acquire a lock on the Mutex to safely access the HashMap
-                            // this blocks other threads/tasks from writing to the HashMap until lock is released
-                            let mut db_locked = db.lock().unwrap(); // `unwrap()` is "safe" here for simplicity
-                            db_locked.insert(key, value);
-                            response = "OK\n".to_string();
-                        } else {
-                            response = "ERR wrong number of arguments for 'SET' command\n".to_string();
-                        }
-                    }
-                    "GET" => {
-                        // handle get command: GET key
-                        if parts.len() == 2 {
-                            let key = parts[1].to_string();
-
-                            // acquire lock again
-                            let db_locked = db.lock().unwrap();
-                            response = match db_locked.get(&key) {
-                                Some(value) => format!("{}\n", value), // key found return value
-                                None => "(nil)\n".to_string(),        // key not found return nil
-                            };
-                        } else {
-                            response = "ERR wrong number of arguments for 'GET' command\n".to_string();
-                        }
-                    }
-                    "DEL" => {
-                        // handle del command: DEL key
-                        if parts.len() == 2 {
-                            let key = parts[1].to_string();
-
-                            // acquire lock
-                            let mut db_locked = db.lock().unwrap();
-                            response = match db_locked.remove(&key) {
-                                Some(_) => "OK\n".to_string(), // key exists and is removed
-                                None => "(nil)\n".to_string(), // key not found
-                            };
-                        } else {
-                            response = "ERR wrong number of arguments for 'DEL' command\n".to_string();
-                        }
-                    }
-                    "QUIT" => {
-                        // quit command to close the conn
-                        response = "Connection will be closed shortly!\n".to_string();
-                        socket.write_all(response.as_bytes()).await?;
-                        return Ok(()); // exit the loop and terminate the client handler task
-                    }
-                    "LIST" => {
-                        // list command to list available commands
-                        response = "Available commands are:\n SET <key> <value>\n GET <key>\n DEL <key>\n QUIT (to close connection)\n".to_string();
-                    }
-                    _ => {
-                        // handle unknown commands
-                        response = "ERR unknown command\n Use LIST to see available commands\n".to_string();
+                // execute command and get RESP formatted response
+                let exec_result = cmd.clone().execute(Arc::clone(&db), socket).await;
+                match exec_result {
+                    Ok(res) => response = res,
+                    Err(e) => {
+                        // Propagate the error directly
+                        return Err(e);
                     }
                 }
-            },
-            None => {
-                // handle empty command string
-                response = "ERR empty command\n".to_string();
+            }
+            Ok(Some(_other_value)) => {
+                // if it's not an array (eg: simple string), it's a malformed command
+                response = RespValue::Error("ERR Protocol error: expected array".to_string());
+                cmd = Command::Unknown; // mark as unknwon command for logging purposes
+            }
+            Ok(None) => {
+                // if the stream is closed, break out of loop and close connection
+                return Ok(());
+            }
+            Err(e) => {
+                // handle error parsing RESP value
+                eprintln!("RESP parse error: {}", e);
+                response = RespValue::Error(format!("ERR Protocol parsing error: {}", e));
+                cmd = Command::Unknown; // mark as unknown command for logging purposes
             }
         }
-            
 
-        // write generated response back to the client
-        socket.write_all(response.as_bytes()).await?;
+        // send the response back to the client
+        socket.write_all(&response.to_bytes()).await?;
+
+        // it the command was QUIT, close the connection and return
+        if matches!(cmd, Command::Quit) {
+            return Ok(());
+        }
     }
 }
-
