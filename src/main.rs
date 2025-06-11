@@ -14,6 +14,10 @@ mod command;  //  Command enum and command parsing/execution logic
 use protocol::RespValue;
 use command::Command;
 
+// define server password
+// hardcoded for simplicity, should be loaded from config file or env variable
+const SERVER_PASSWORD: &str = "123";
+
 #[tokio::main] // mark this as the main function for a tokio runtime
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create in memory HashMap to store key-value pairs with arc<mutex for safe, shared and mutable access to it 
@@ -49,7 +53,8 @@ async fn handle_client(
     socket: &mut TcpStream,
     db: Arc<Mutex<HashMap<String, Vec<u8>>>>, //changed to Vec<u8>
 ) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
+    let mut is_authenticated = false;    
+    loop {
         // attempt to parse a RESP value from a tcp stream
         let resp_value = RespValue::from_stream(socket).await;
 
@@ -62,8 +67,8 @@ async fn handle_client(
                 cmd = Command::parse_from_resp_array(array);
                 println!("Parsed command: {:?}", cmd); // log parsed command
 
-                // execute command and get RESP formatted response
-                let exec_result = cmd.clone().execute(Arc::clone(&db), socket).await;
+                // execute command passing the mutable authentication status and the correct password
+                let exec_result = cmd.clone().execute(Arc::clone(&db), socket, &mut is_authenticated, SERVER_PASSWORD).await;
                 match exec_result {
                     Ok(res) => response = res,
                     Err(e) => {

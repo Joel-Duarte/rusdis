@@ -11,6 +11,7 @@ pub enum Command {
     Set { key: String, value: Vec<u8> }, // uses Vec<u8> for binary safety
     Get { key: String },
     Del { key: String },
+    Auth { password: String }, // Authentication command (simplified with hardcoded password)
     Quit,
     Unknown,
 }
@@ -73,8 +74,30 @@ impl Command {
                     Command::Unknown // wrong number of arguments
                 }
             }
+            "AUTH" => { // parse AUTH command
+                if array.len() == 2 {
+                    if let Some(RespValue::BulkString(password_bytes)) = array.get(1) {
+                        let password = String::from_utf8_lossy(password_bytes).to_string();
+                        Command::Auth { password }
+                    } else {
+                        Command::Unknown // malformed AUTH command arguments
+                    }
+                } else {
+                    Command::Unknown // wrong number of arguments 
+                }
+            }
             "QUIT" => Command::Quit,
             _ => Command::Unknown,
+        }
+    }
+
+
+    // helper function to check if the client is authenticated before executing certain commands
+    fn check_auth(is_authenticated: &bool) -> Result<(), RespValue> {
+        if !*is_authenticated {
+            Err(RespValue::Error("NOAUTH Authentication required.".to_string()))
+        } else {
+            Ok(())
         }
     }
 
@@ -83,9 +106,23 @@ impl Command {
         self,
         db: Arc<Mutex<HashMap<String, Vec<u8>>>>, 
         _socket: &mut (impl AsyncWriteExt + Unpin), // _socket is currently unused but might be useful for Pub/Sub
+        is_authenticated: &mut bool, // pass authenticated status
+        correct_password: &str, // pass correct password
     ) -> Result<RespValue, Box<dyn std::error::Error + Send + Sync >> { // added Send + Sync for error handling across threads
         match self {
+            Command::Auth { password } => {
+                if password == correct_password {
+                    *is_authenticated = true; // set client as authenticated
+                    Ok(RespValue::SimpleString("OK".to_string()))
+                } else {
+                    *is_authenticated = false; // set client as unauthenticated
+                    Ok(RespValue::Error("Err invalid password".to_string()))
+                }
+            },
             Command::Set { key, value } => {
+                if let Err(e) = Command::check_auth(is_authenticated) {
+                    return Ok(e);
+                }
                 // acquire a lock on the Mutex
                 let mut db_locked = db
                     .lock()
@@ -94,6 +131,9 @@ impl Command {
                 Ok(RespValue::SimpleString("OK".to_string()))
             }
             Command::Get { key } => {
+                if let Err(e) = Command::check_auth(is_authenticated) {
+                    return Ok(e);
+                }
                 // acquire a lock
                 let db_locked = db
                     .lock()
@@ -104,6 +144,9 @@ impl Command {
                 }
             }
             Command::Del { key } => {
+                if let Err(e) = Command::check_auth(is_authenticated) {
+                    return Ok(e);
+                }
                 // acquire a lock
                 let mut db_locked = db
                     .lock()
