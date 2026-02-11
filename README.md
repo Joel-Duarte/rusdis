@@ -1,5 +1,5 @@
 
-# Rusdis a simle Redis "clone"
+# Rusdis a simple Redis "clone"
 
 
 ## Overview
